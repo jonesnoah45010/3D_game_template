@@ -27,6 +27,10 @@ python3 -m venv .venv
 
 Once Flask starts, open [http://localhost:8080](http://localhost:8080). The landing page links to the game at [http://localhost:8080/basic_game](http://localhost:8080/basic_game).
 
+Once you launch the Flask app and click the **Play Game** button, you will launch the game shown below.
+
+![3D web game launched in the browser](static/images/game_screenshot.png)
+
 ## How `launch.sh` works
 
 `launch.sh` is a Bash startup wrapper for the Flask application. It performs the following steps:
