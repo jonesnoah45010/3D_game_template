@@ -1,0 +1,1405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Player (FBX Animated) + Original Map</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+    canvas { display: block; }
+
+    /* ---------- Debug UI ---------- */
+    #debug-ui {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 9999;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      font-size: 14px;
+      color: #fff;
+      user-select: none;
+      background: rgba(0,0,0,0.55);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 10px;
+      padding: 10px 12px;
+      backdrop-filter: blur(6px);
+    }
+    #debug-ui label {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      cursor: pointer;
+    }
+    #debug-ui input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      accent-color: #8be9fd;
+      cursor: pointer;
+    }
+    #debug-ui .hint {
+      margin-top: 6px;
+      font-size: 12px;
+      opacity: 0.8;
+    }
+  </style>
+</head>
+<body>
+  <script src="/static/js/ammo/ammo.wasm.js"></script>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/static/js/three/three.module.js"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import * as THREE from '/static/js/three/three.module.js';
+    import { FBXLoader } from '/static/js/three/loaders/FBXLoader.js';
+    import { MTLLoader } from '/static/js/three/MTLLoader.js';
+    import { OBJLoader } from '/static/js/three/OBJLoader.js';
+
+    // -------- Debug --------
+    let DEBUG_MODE = false;
+
+    // -------- Config --------
+    const GRAVITY = -9.81;
+    const PLANE_SIZE = 1000;
+
+    const PLAYER_MOVE_MIDAIR = true;
+    const PLAYER_MID_AIR_DAMPEN = 0.5;
+    const PLAYER_JUMP_IMPULSE = 35;
+
+    const PLAYER_DEFAULT_FRICTION = 2.5;
+    const GROUND_NORMAL_MIN_Y = 0.10;
+    const GROUND_BAND_FRACTION = 0.10;
+
+    // Helps the bottom of the capsule move over small inclines and uneven ground.
+    const PLAYER_SLOPE_DETECTOR_HEIGHT = 10.0;
+    const PLAYER_SLOPE_UP_FORCE = 40.0;
+
+    // Wall collisions push the player away instead of allowing them to cling to the surface.
+    const WALL_NORMAL_MAX_Y = 0.30;
+    const WALL_PUSH_AWAY_FORCE = 65.0;
+    const WALL_PUSH_DOWN_FORCE = 35.0;
+
+
+    // Camera follow
+    const CAMERA_DISTANCE = 35;
+    const CAMERA_LOOK_HEIGHT = 4;
+    const CAMERA_INITIAL_PITCH_DEG = 30;
+    const CAMERA_MIN_PITCH_DEG = -10;
+    const CAMERA_MAX_PITCH_DEG = 60;
+
+    // Player capsule physics
+    const PLAYER_RADIUS = 2;
+    const PLAYER_HEIGHT = 8;
+    const PLAYER_MASS = 1;
+
+    const PLAYER_STARTING_POSITION = new THREE.Vector3(0, 0, 0)
+    const PLAYER_STARTING_YAW_DEG = 180;
+
+    // Movement tuning
+    const PLAYER_MAX_SPEED = 15.0;
+    const PLAYER_SPRINT_INCREASE_PERCENT = 50;
+    const PLAYER_ACCEL = 55.0;
+    const PLAYER_BRAKE = 75.0;
+    const PLAYER_AIR_ACCEL = 18.0;
+    const PLAYER_AIR_BRAKE = 8.0;
+    const PLAYER_SIDE_DAMP_GROUND = 18.0;
+    const PLAYER_SIDE_DAMP_AIR = 2.0;
+    const PLAYER_USE_STRAFE_DAMP = true;
+
+    // Mouse look (radians per pixel of mouse movement)
+    const MOUSE_TURN_SENSITIVITY = -0.0025;
+    const MOUSE_PITCH_SENSITIVITY = 0.0025;
+
+    // ---------- Player FBX visual + animations ----------
+    const PLAYER_FBX_IDLE   = '/static/player_fbx/idle.fbx';
+    const PLAYER_FBX_MOVE   = '/static/player_fbx/move.fbx';
+    const PLAYER_FBX_IN_AIR = '/static/player_fbx/in_air.fbx';
+    const PLAYER_FBX_JUMP   = '/static/player_fbx/jump.fbx';
+    const PLAYER_FBX_LEFT_STRAFE  = '/static/player_fbx/left_strafe.fbx';
+    const PLAYER_FBX_RIGHT_STRAFE = '/static/player_fbx/right_strafe.fbx';
+
+    const PLAYER_MODEL_SCALE    = new THREE.Vector3(0.05, 0.05, 0.05);
+    const PLAYER_MODEL_OFFSET   = new THREE.Vector3(0, -PLAYER_HEIGHT/2, 0);
+    const PLAYER_MODEL_ROTATION = new THREE.Euler(0, 0, 0);
+
+    const FADE_SECONDS = 0.15;
+
+    // -------- Animation ground probe (reduces in_air sensitivity) --------
+    // Enter in_air only when *no ground is within* ANIM_FALL_TRIGGER_DISTANCE below the player.
+    // Return to grounded anims when ground is within ANIM_GROUND_SNAP_DISTANCE (hysteresis).
+    // Also requires ANIM_AIR_MIN_TIME seconds off-ground before switching to in_air to avoid tiny gaps.
+    const ANIM_PROBE_LENGTH = 10;                 // how far down we raycast to look for ground
+    const ANIM_FALL_TRIGGER_DISTANCE = 4.0;      // must be farther than this to enter in_air
+    const ANIM_GROUND_SNAP_DISTANCE  = 3.0;      // must be within this to snap back to grounded anims
+    const ANIM_AIR_MIN_TIME          = 0.10;     // seconds before allowing in_air switch
+
+    // Multi-ray offsets (in world units) around the player's base to ignore small ridges/gaps.
+    const ANIM_GROUND_PROBE_OFFSETS = [
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(0.35, 0, 0.35),
+      new THREE.Vector3(-0.35, 0, 0.35),
+      new THREE.Vector3(0.35, 0, -0.35),
+      new THREE.Vector3(-0.35, 0, -0.35),
+    ];
+
+    // -------- State --------
+    let scene, camera, renderer;
+    let physicsWorld, tmpTransform;
+    let dispatcher = null;
+
+    // Contact-derived grounding and wall collision state
+    let playerGrounded = false;
+    let playerOnWall = false;
+    let playerOnSlope = false;
+    const playerWallNormal = new THREE.Vector3();
+    let playerPtr = 0;
+    let Player = null;
+    let playerDebugMesh = null;
+
+    // Animation-state air gating (prevents flicker to in_air on tiny gaps)
+    let animInAir = false;
+    let animAirTimer = 0;
+
+    // FBX Visual / Animation state
+    let playerVisual = null;
+    let playerMixer = null;
+    let cameraPitch = THREE.MathUtils.degToRad(CAMERA_INITIAL_PITCH_DEG);
+
+    const sharedMtlLoader = new MTLLoader();
+    const sharedObjLoader = new OBJLoader();
+
+    // gameObjects = things that get synced from physics transforms every frame
+    const gameObjects = [];
+    const debugAxes = [];
+    let debugUiCheckbox = null;
+
+    // NEW: debug-only visuals for "world-space" trimesh colliders (we do NOT sync these)
+    const staticTrimeshDebug = []; // { mesh?, axes? }
+
+    // -------- Debug helpers --------
+    function createAxes(length = 8) {
+      const g = new THREE.Group();
+      const x = new THREE.ArrowHelper(new THREE.Vector3(1,0,0), new THREE.Vector3(0,0,0), length, 0xff4444);
+      const y = new THREE.ArrowHelper(new THREE.Vector3(0,1,0), new THREE.Vector3(0,0,0), length, 0x44ff44);
+      const z = new THREE.ArrowHelper(new THREE.Vector3(0,0,1), new THREE.Vector3(0,0,0), length, 0x4444ff);
+      g.add(x, y, z);
+      g.visible = DEBUG_MODE;
+      scene && scene.add(g);
+      return g;
+    }
+
+    function setDebugMode(on) {
+      DEBUG_MODE = on;
+      if (debugUiCheckbox) debugUiCheckbox.checked = on;
+
+      if (playerDebugMesh) playerDebugMesh.visible = on;
+
+      for (const obj of gameObjects) {
+        if (obj.mesh) obj.mesh.visible = on;
+        if (obj.axes) obj.axes.visible = on;
+      }
+      for (const entry of debugAxes) entry.group.visible = on;
+
+      // NEW: trimesh debug visuals
+      for (const t of staticTrimeshDebug) {
+        if (t.mesh) t.mesh.visible = on;
+        if (t.axes) t.axes.visible = on;
+      }
+    }
+
+    function createDebugUI() {
+      const ui = document.createElement('div');
+      ui.id = 'debug-ui';
+      ui.innerHTML = `
+        <label>
+          <input id="debug-toggle" type="checkbox" />
+          <span>Debug Colliders</span>
+        </label>
+        <div class="hint">Hotkey: <b>\`</b></div>
+        <div class="hint">Click game to capture mouse; <b>Esc</b> releases it</div>
+        <div class="hint">Look: <b>Mouse</b></div>
+      `;
+      document.body.appendChild(ui);
+
+      debugUiCheckbox = ui.querySelector('#debug-toggle');
+      debugUiCheckbox.checked = DEBUG_MODE;
+      debugUiCheckbox.addEventListener('change', () => setDebugMode(debugUiCheckbox.checked));
+
+      debugUiCheckbox.tabIndex = -1;
+      debugUiCheckbox.addEventListener('keydown', (e) => {
+        if (e.code === 'Space') { e.preventDefault(); e.stopPropagation(); }
+      });
+      debugUiCheckbox.addEventListener('click', () => debugUiCheckbox.blur());
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Backquote') setDebugMode(!DEBUG_MODE);
+    });
+
+    // -------- Init --------
+    async function init() {
+      await Ammo();
+      tmpTransform = new Ammo.btTransform();
+
+      initThree();
+      createDebugUI();
+      initPhysics();
+      createSkySphere();
+      createPlane();
+      createLighting();
+      createStaticGroundCollider();
+      spawnEnvironment();
+      await createPlayer(PLAYER_STARTING_POSITION);
+
+      bindKeys();
+
+      setDebugMode(DEBUG_MODE);
+      update();
+    }
+
+    function initThree() {
+      scene = new THREE.Scene();
+
+      camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 20000);
+      camera.position.set(0, 55, 100);
+      camera.lookAt(0, 0, 0);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      document.body.appendChild(renderer.domElement);
+
+      renderer.domElement.addEventListener('click', () => {
+        if (document.pointerLockElement !== renderer.domElement) {
+          renderer.domElement.requestPointerLock();
+        }
+      });
+
+      document.addEventListener('mousemove', (e) => {
+        if (document.pointerLockElement === renderer.domElement && Player) {
+          turn(e.movementX * MOUSE_TURN_SENSITIVITY);
+          cameraPitch = THREE.MathUtils.clamp(
+            cameraPitch - e.movementY * MOUSE_PITCH_SENSITIVITY,
+            THREE.MathUtils.degToRad(CAMERA_MIN_PITCH_DEG),
+            THREE.MathUtils.degToRad(CAMERA_MAX_PITCH_DEG)
+          );
+        }
+      });
+
+      window.addEventListener('resize', onResize);
+    }
+
+    function initPhysics() {
+      const config = new Ammo.btDefaultCollisionConfiguration();
+      dispatcher = new Ammo.btCollisionDispatcher(config);
+      const broadphase = new Ammo.btDbvtBroadphase();
+      const solver = new Ammo.btSequentialImpulseConstraintSolver();
+      physicsWorld = new Ammo.btDiscreteDynamicsWorld(dispatcher, broadphase, solver, config);
+      physicsWorld.setGravity(new Ammo.btVector3(0, GRAVITY, 0));
+    }
+
+    // -------- Environment --------
+    const textureLoader = new THREE.TextureLoader();
+
+    function createSkySphere() {
+      const geo = new THREE.SphereGeometry(10000, 60, 40);
+      textureLoader.load('/static/textures/blue_sky.jpg', (texture) => {
+        const mat = new THREE.MeshBasicMaterial({ map: texture, side: THREE.BackSide });
+        scene.add(new THREE.Mesh(geo, mat));
+      });
+    }
+
+    function createPlane() {
+      textureLoader.load('/static/textures/grass.jpg', (texture) => {
+        const plane = new THREE.Mesh(
+          new THREE.PlaneGeometry(PLANE_SIZE, PLANE_SIZE),
+          new THREE.MeshStandardMaterial({ map: texture })
+        );
+        plane.rotation.x = -Math.PI / 2;
+        scene.add(plane);
+      });
+    }
+
+    function createLighting() {
+      scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+      const light = new THREE.DirectionalLight(0xffffff, 1.0);
+      light.position.set(10, 20, 10);
+      scene.add(light);
+    }
+
+    function createStaticGroundCollider() {
+      const shape = new Ammo.btStaticPlaneShape(new Ammo.btVector3(0, 1, 0), 0);
+      const transform = new Ammo.btTransform();
+      transform.setIdentity();
+      transform.setOrigin(new Ammo.btVector3(0, 0, 0));
+      const motionState = new Ammo.btDefaultMotionState(transform);
+      const rbInfo = new Ammo.btRigidBodyConstructionInfo(0, motionState, shape, new Ammo.btVector3(0, 0, 0));
+      const body = new Ammo.btRigidBody(rbInfo);
+      physicsWorld.addRigidBody(body);
+
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(PLANE_SIZE, 2, PLANE_SIZE),
+        new THREE.MeshBasicMaterial({ wireframe: true })
+      );
+      mesh.position.set(0, 1, 0);
+      mesh.visible = DEBUG_MODE;
+      scene.add(mesh);
+
+      const axes = createAxes(20);
+      debugAxes.push({ group: axes, ownerName: 'ground' });
+
+      gameObjects.push({ name: 'ground', body, mesh, axes });
+    }
+
+    function renderStaticModel(objPath, mtlPath, position, scale, rotation) {
+      sharedMtlLoader.load(mtlPath, (materials) => {
+        materials.preload();
+        const objLoader = new OBJLoader();
+        objLoader.setMaterials(materials);
+        objLoader.load(objPath, (object) => {
+          object.position.copy(position);
+          if (scale) object.scale.copy(scale);
+          if (rotation) object.rotation.copy(rotation);
+          scene.add(object);
+        });
+      });
+    }
+
+    function createCapsuleObstacle(position, radius, height, mass = 0, modelOptions = null, name = 'CapsuleObstacle') {
+      const shape = new Ammo.btCapsuleShape(radius, height - 2 * radius);
+      const transform = new Ammo.btTransform();
+      transform.setIdentity();
+      transform.setOrigin(new Ammo.btVector3(position.x, position.y + height / 2, position.z));
+      const motionState = new Ammo.btDefaultMotionState(transform);
+      const rbInfo = new Ammo.btRigidBodyConstructionInfo(mass, motionState, shape, new Ammo.btVector3(0, 0, 0));
+      const body = new Ammo.btRigidBody(rbInfo);
+      physicsWorld.addRigidBody(body);
+
+      const mesh = new THREE.Mesh(
+        new THREE.CapsuleGeometry(radius, height - 2 * radius, 4, 8),
+        new THREE.MeshBasicMaterial({ color: 0xff0000, wireframe: true })
+      );
+      mesh.position.copy(position);
+      mesh.visible = DEBUG_MODE;
+      scene.add(mesh);
+
+      const axes = createAxes(10);
+      debugAxes.push({ group: axes, ownerName: name });
+
+      gameObjects.push({ name, body, mesh, axes });
+
+      if (modelOptions?.objPath && modelOptions?.mtlPath) {
+        const offset = modelOptions.offset || new THREE.Vector3(0, 0, 0);
+        const modelPos = position.clone().add(offset);
+        renderStaticModel(
+          modelOptions.objPath,
+          modelOptions.mtlPath,
+          modelPos,
+          modelOptions.scale,
+          modelOptions.rotation
+        );
+      }
+    }
+
+    function createBoxObstacle(position, size, mass = 0, modelOptions = null, name = 'BoxObstacle') {
+      const shape = new Ammo.btBoxShape(new Ammo.btVector3(size.x / 2, size.y / 2, size.z / 2));
+      const transform = new Ammo.btTransform();
+      transform.setIdentity();
+      transform.setOrigin(new Ammo.btVector3(position.x, position.y + size.y / 2, position.z));
+      const motionState = new Ammo.btDefaultMotionState(transform);
+      const rbInfo = new Ammo.btRigidBodyConstructionInfo(mass, motionState, shape, new Ammo.btVector3(0, 0, 0));
+      const body = new Ammo.btRigidBody(rbInfo);
+      physicsWorld.addRigidBody(body);
+
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(size.x, size.y, size.z),
+        new THREE.MeshBasicMaterial({ color: 0x0000ff, wireframe: true })
+      );
+      mesh.position.copy(position);
+      mesh.visible = DEBUG_MODE;
+      scene.add(mesh);
+
+      const axes = createAxes(10);
+      debugAxes.push({ group: axes, ownerName: name });
+
+      gameObjects.push({ name, body, mesh, axes });
+
+      if (modelOptions?.objPath && modelOptions?.mtlPath) {
+        const offset = modelOptions.offset || new THREE.Vector3(0, 0, 0);
+        const modelPos = position.clone().add(offset);
+        renderStaticModel(
+          modelOptions.objPath,
+          modelOptions.mtlPath,
+          modelPos,
+          modelOptions.scale,
+          modelOptions.rotation
+        );
+      }
+    }
+
+    function createBoxDynamic(position, size, mass = 0.001, modelOptions = null, name = 'BoxDynamic') {
+      const shape = new Ammo.btBoxShape(new Ammo.btVector3(size.x / 2, size.y / 2, size.z / 2));
+      const transform = new Ammo.btTransform();
+      transform.setIdentity();
+      transform.setOrigin(new Ammo.btVector3(position.x, position.y + size.y / 2, position.z));
+      const motionState = new Ammo.btDefaultMotionState(transform);
+      const localInertia = new Ammo.btVector3(0, 0, 0);
+      shape.calculateLocalInertia(mass, localInertia);
+      const rbInfo = new Ammo.btRigidBodyConstructionInfo(mass, motionState, shape, localInertia);
+      const body = new Ammo.btRigidBody(rbInfo);
+
+      body.setRestitution(0.1);
+      body.setFriction(1.0);
+      body.setRollingFriction(0.3);
+      body.setActivationState(Ammo.DISABLE_DEACTIVATION);
+
+      physicsWorld.addRigidBody(body);
+      body.activate();
+
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(size.x, size.y, size.z),
+        new THREE.MeshBasicMaterial({ color: 0xffff00, wireframe: true })
+      );
+      mesh.position.copy(position);
+      mesh.visible = DEBUG_MODE;
+      scene.add(mesh);
+
+      const axes = createAxes(10);
+      debugAxes.push({ group: axes, ownerName: name });
+
+      if (modelOptions?.objPath && modelOptions?.mtlPath) {
+        const offset = modelOptions.offset || new THREE.Vector3(0, 0, 0);
+        const scale = modelOptions.scale || new THREE.Vector3(1, 1, 1);
+        const rotationEuler = modelOptions.rotation || new THREE.Euler(0, 0, 0);
+        const rotationOffsetQuat = new THREE.Quaternion().setFromEuler(rotationEuler);
+
+        sharedMtlLoader.load(modelOptions.mtlPath, (materials) => {
+          materials.preload();
+          const objLoader = new OBJLoader();
+          objLoader.setMaterials(materials);
+          objLoader.load(modelOptions.objPath, (object) => {
+            object.position.copy(position.clone().add(offset));
+            object.scale.copy(scale);
+            scene.add(object);
+
+            gameObjects.push({
+              name, body, mesh,
+              visual: object,
+              visualOffset: offset,
+              visualRotationOffset: rotationOffsetQuat,
+              axes
+            });
+          });
+        });
+      } else {
+        gameObjects.push({ name, body, mesh, axes });
+      }
+    }
+
+    // ------------------------------------------------------------
+    // NEW: Static trimesh collider from OBJ/MTL (concave-safe static)
+    // We build the triangle mesh in WORLD SPACE and create a static body at identity.
+    // We do NOT sync this object in syncVisualsFromPhysics().
+    // ------------------------------------------------------------
+    function createStaticTrimeshObstacleFromObjMtl(position, modelOptions, name = 'StaticTrimesh') {
+      const objPath = modelOptions?.objPath;
+      const mtlPath = modelOptions?.mtlPath;
+      if (!objPath || !mtlPath) {
+        console.warn(`[${name}] Missing objPath/mtlPath`);
+        return;
+      }
+
+      const scale = modelOptions.scale || new THREE.Vector3(1,1,1);
+      const rotation = modelOptions.rotation || new THREE.Euler(0,0,0);
+      const offset = modelOptions.offset || new THREE.Vector3(0,0,0);
+
+      // Visual position matches your existing renderStaticModel behavior: position + offset
+      const visualPos = position.clone().add(offset);
+
+      sharedMtlLoader.load(mtlPath, (materials) => {
+        materials.preload();
+        const objLoader = new OBJLoader();
+        objLoader.setMaterials(materials);
+
+        objLoader.load(objPath, (object) => {
+          object.name = `${name}_visual`;
+          object.position.copy(visualPos);
+          object.scale.copy(scale);
+          object.rotation.copy(rotation);
+          object.updateMatrixWorld(true);
+          scene.add(object);
+
+          // Build Ammo triangle mesh from the loaded THREE object (world-space triangles)
+          const triMesh = new Ammo.btTriangleMesh(true, true);
+
+          const posAttrToTriangles = (geom) => {
+            const pos = geom.attributes.position;
+            if (!pos) return;
+
+            const idx = geom.index ? geom.index.array : null;
+            const v = new THREE.Vector3();
+
+            const a = new THREE.Vector3();
+            const b = new THREE.Vector3();
+            const c = new THREE.Vector3();
+
+            const readVertex = (i, out) => {
+              out.set(pos.getX(i), pos.getY(i), pos.getZ(i));
+            };
+
+            if (idx) {
+              for (let i = 0; i < idx.length; i += 3) {
+                readVertex(idx[i],   a);
+                readVertex(idx[i+1], b);
+                readVertex(idx[i+2], c);
+
+                const va = new Ammo.btVector3(a.x, a.y, a.z);
+                const vb = new Ammo.btVector3(b.x, b.y, b.z);
+                const vc = new Ammo.btVector3(c.x, c.y, c.z);
+
+                triMesh.addTriangle(va, vb, vc, true);
+
+                Ammo.destroy(va); Ammo.destroy(vb); Ammo.destroy(vc);
+              }
+            } else {
+              for (let i = 0; i < pos.count; i += 3) {
+                v.set(pos.getX(i), pos.getY(i), pos.getZ(i)); a.copy(v);
+                v.set(pos.getX(i+1), pos.getY(i+1), pos.getZ(i+1)); b.copy(v);
+                v.set(pos.getX(i+2), pos.getY(i+2), pos.getZ(i+2)); c.copy(v);
+
+                const va = new Ammo.btVector3(a.x, a.y, a.z);
+                const vb = new Ammo.btVector3(b.x, b.y, b.z);
+                const vc = new Ammo.btVector3(c.x, c.y, c.z);
+
+                triMesh.addTriangle(va, vb, vc, true);
+
+                Ammo.destroy(va); Ammo.destroy(vb); Ammo.destroy(vc);
+              }
+            }
+          };
+
+          object.traverse((child) => {
+            if (!child.isMesh || !child.geometry) return;
+
+            // Clone geometry and bake child's WORLD transform into vertices
+            const geom = child.geometry.clone();
+            geom.applyMatrix4(child.matrixWorld);
+
+            // Ensure we have triangles
+            if (!geom.attributes.position) return;
+            posAttrToTriangles(geom);
+          });
+
+          const useQuantizedAabbCompression = true;
+          const buildBvh = true;
+          const shape = new Ammo.btBvhTriangleMeshShape(triMesh, useQuantizedAabbCompression, buildBvh);
+          shape.setMargin(0.02);
+
+          // Static body at identity (since triangles are already in world space)
+          const transform = new Ammo.btTransform();
+          transform.setIdentity();
+          transform.setOrigin(new Ammo.btVector3(0, 0, 0));
+          transform.setRotation(new Ammo.btQuaternion(0, 0, 0, 1));
+
+          const motionState = new Ammo.btDefaultMotionState(transform);
+          const rbInfo = new Ammo.btRigidBodyConstructionInfo(0, motionState, shape, new Ammo.btVector3(0, 0, 0));
+          const body = new Ammo.btRigidBody(rbInfo);
+          physicsWorld.addRigidBody(body);
+
+          // Optional debug wireframe for the collider: reuse the loaded visual geometry
+          const dbgGeo = new THREE.BufferGeometry();
+          const lines = [];
+          object.updateMatrixWorld(true);
+
+          // Build a *rough* wireframe by using Three's built-in WireframeGeometry on the visual
+          // (This is debug-only, not physics-relevant)
+          const wfGroup = new THREE.Group();
+          object.traverse((child) => {
+            if (!child.isMesh || !child.geometry) return;
+            const wf = new THREE.WireframeGeometry(child.geometry);
+            const wfMat = new THREE.LineBasicMaterial({ color: 0xffffff });
+            const wfLines = new THREE.LineSegments(wf, wfMat);
+            wfLines.applyMatrix4(child.matrixWorld);
+            wfGroup.add(wfLines);
+          });
+          wfGroup.visible = DEBUG_MODE;
+          scene.add(wfGroup);
+
+          const axes = createAxes(10);
+          axes.position.copy(position);
+          axes.visible = DEBUG_MODE;
+
+          staticTrimeshDebug.push({ mesh: wfGroup, axes });
+
+          // Keep reference if you ever want to remove it later
+          // (not synced each frame)
+          console.log(`[${name}] trimesh collider created`);
+        });
+      });
+    }
+
+    function spawnEnvironment() {
+      const crateOpts = {
+        objPath: '/static/models/crate/tinker.obj',
+        mtlPath: '/static/models/crate/obj.mtl',
+        scale: new THREE.Vector3(1, 1, 1),
+        rotation: new THREE.Euler(-Math.PI/2, 0, 0),
+        offset: new THREE.Vector3(-6, -2.5, -8)
+      };
+      createBoxDynamic(new THREE.Vector3(-90, 0, 25),  new THREE.Vector3(5,5,5), 1.011, crateOpts, 'crate1');
+      createBoxDynamic(new THREE.Vector3( 90, 0, 25),  new THREE.Vector3(5,5,5), 1.011, crateOpts, 'crate2');
+
+
+      // --- SkyScraper model options ---
+      const skyScraperOpts = {
+        objPath: '/static/models/skyScraper/tinker.obj',
+        mtlPath: '/static/models/skyScraper/obj.mtl',
+        scale: new THREE.Vector3(0.3, 0.3, 0.05),
+        rotation: new THREE.Euler(Math.PI / 2, Math.PI, Math.PI),
+        offset: new THREE.Vector3(-1, 0, 0)
+      };
+
+      const skyScraper1Opts = {
+        objPath: '/static/models/skyScraper/tinker.obj',
+        mtlPath: '/static/models/skyScraper/obj.mtl',
+        scale: new THREE.Vector3(0.3, 0.3, 0.1),
+        rotation: new THREE.Euler(Math.PI / 2, Math.PI, Math.PI),
+        offset: new THREE.Vector3(-1, 0, 0)
+      };
+
+      const skyScraper2Opts = {
+        objPath: '/static/models/skyScraper2/tinker.obj',
+        mtlPath: '/static/models/skyScraper2/obj.mtl',
+        scale: new THREE.Vector3(1.5, 1.5, 1.5),
+        rotation: new THREE.Euler(Math.PI / 2, Math.PI, Math.PI),
+        offset: new THREE.Vector3(-1, 0, 0)
+      };
+
+
+      // spawn a building
+      createStaticTrimeshObstacleFromObjMtl(
+        new THREE.Vector3(0, 0, -100),
+        skyScraper2Opts,
+        'skyScraper1'
+      );
+
+
+      // spawn a building
+      createStaticTrimeshObstacleFromObjMtl(
+        new THREE.Vector3(100, 0, -200),
+        skyScraperOpts,
+        'skyScraper2'
+      );
+
+      // spawn a building
+      createStaticTrimeshObstacleFromObjMtl(
+        new THREE.Vector3(100, 0, -100),
+        skyScraper1Opts,
+        'skyScraper6'
+      );
+
+      // spawn a building
+      createStaticTrimeshObstacleFromObjMtl(
+        new THREE.Vector3(-100, 0, -200),
+        skyScraperOpts,
+        'skyScraper3'
+      );
+
+      // spawn a building
+      createStaticTrimeshObstacleFromObjMtl(
+        new THREE.Vector3(-100, 0, -100),
+        skyScraper1Opts,
+        'skyScraper7'
+      );
+
+      // spawn a building
+      createStaticTrimeshObstacleFromObjMtl(
+        new THREE.Vector3(100, 0, 0),
+        skyScraperOpts,
+        'skyScraper4'
+      );
+
+      // spawn a building
+      createStaticTrimeshObstacleFromObjMtl(
+        new THREE.Vector3(-100, 0, 0),
+        skyScraperOpts,
+        'skyScraper5'
+      );
+
+
+
+
+      const rockOpts = {
+        objPath: '/static/models/rock/tinker.obj',
+        mtlPath: '/static/models/rock/obj.mtl',
+        scale: new THREE.Vector3(0.9, 0.9, 0.9),
+        rotation: new THREE.Euler(0, Math.PI / 2, Math.PI / 2),
+        offset: new THREE.Vector3(-30, 28, -4)
+      };
+      const addRock = (pos, r=30, h=60, name) => createCapsuleObstacle(pos, r, h, 0, rockOpts, name);
+
+      let rockCounter = 1000;
+      const rockSpacing = 50;
+      for (let x = -PLANE_SIZE/2; x <= PLANE_SIZE/2; x += rockSpacing) {
+        addRock(new THREE.Vector3(x, -30,  PLANE_SIZE/2), 30, 60, `rock${rockCounter++}`);
+        addRock(new THREE.Vector3(x, -30, -PLANE_SIZE/2), 30, 60, `rock${rockCounter++}`);
+      }
+      for (let z = -PLANE_SIZE/2 + rockSpacing; z < PLANE_SIZE/2; z += rockSpacing) {
+        addRock(new THREE.Vector3( PLANE_SIZE/2, -30, z), 30, 60, `rock${rockCounter++}`);
+        addRock(new THREE.Vector3(-PLANE_SIZE/2, -30, z), 30, 60, `rock${rockCounter++}`);
+      }
+    }
+
+    // -------- Player --------
+    const playerActions = {
+      idle: null,
+      move: null,
+      in_air: null,
+      jump: null,
+      left_strafe: null,
+      right_strafe: null
+    };
+    let playerCurrentAction = null;
+    let playerCurrentState = 'idle';
+
+    let lastMoveAxis = 0;
+    let lastSideAxis = 0;
+    let playerIsSprinting = false;
+    let jumpAnimationPlaying = false;
+    let moveAnimDir = 1;
+
+    const clock = new THREE.Clock();
+    const keys = {};
+    let spaceWasDown = false;
+
+    async function createPlayer(position) {
+      const shape = new Ammo.btCapsuleShape(PLAYER_RADIUS, PLAYER_HEIGHT - 2 * PLAYER_RADIUS);
+      const transform = new Ammo.btTransform();
+      transform.setIdentity();
+      transform.setOrigin(new Ammo.btVector3(position.x, position.y + PLAYER_HEIGHT / 2, position.z));
+      // NEW: apply starting yaw rotation to the player rigid body
+      const yawRad = THREE.MathUtils.degToRad(PLAYER_STARTING_YAW_DEG);
+      const startRot = new Ammo.btQuaternion(0, Math.sin(yawRad / 2), 0, Math.cos(yawRad / 2));
+      transform.setRotation(startRot);
+      const motionState = new Ammo.btDefaultMotionState(transform);
+      const localInertia = new Ammo.btVector3(0, 0, 0);
+      shape.calculateLocalInertia(PLAYER_MASS, localInertia);
+      const rbInfo = new Ammo.btRigidBodyConstructionInfo(PLAYER_MASS, motionState, shape, localInertia);
+      const body = new Ammo.btRigidBody(rbInfo);
+
+      body.setRestitution(0);
+      body.setFriction(PLAYER_DEFAULT_FRICTION);
+      body.setDamping(0.2, 0.98);
+      body.setAngularFactor(new Ammo.btVector3(0, 0, 0));
+      body.setActivationState(Ammo.DISABLE_DEACTIVATION);
+
+      physicsWorld.addRigidBody(body);
+      Player = body;
+
+      playerPtr = Ammo.getPointer(Player);
+
+      playerDebugMesh = new THREE.Mesh(
+        new THREE.CapsuleGeometry(PLAYER_RADIUS, PLAYER_HEIGHT - 2 * PLAYER_RADIUS, 8, 16),
+        new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true })
+      );
+      playerDebugMesh.visible = DEBUG_MODE;
+      scene.add(playerDebugMesh);
+
+      const playerAxes = createAxes(12);
+      debugAxes.push({ group: playerAxes, ownerName: 'player' });
+      Player.__axes = playerAxes;
+
+      const fbxLoader = new FBXLoader();
+
+      const idleObj = await new Promise((resolve, reject) => {
+        fbxLoader.load(PLAYER_FBX_IDLE, resolve, undefined, reject);
+      });
+
+      idleObj.scale.copy(PLAYER_MODEL_SCALE);
+      idleObj.rotation.copy(PLAYER_MODEL_ROTATION);
+
+      idleObj.traverse((c) => {
+        if (c.isMesh) {
+          c.castShadow = false;
+          c.receiveShadow = false;
+          if (c.material) c.material.transparent = false;
+        }
+      });
+
+      scene.add(idleObj);
+      playerVisual = idleObj;
+
+      playerMixer = new THREE.AnimationMixer(playerVisual);
+
+      const idleClip = (idleObj.animations && idleObj.animations.length > 0) ? idleObj.animations[0] : null;
+
+      const [moveClip, inAirClip, jumpClip, leftStrafeClip, rightStrafeClip] = await Promise.all([
+        loadFirstClipFromFBX(fbxLoader, PLAYER_FBX_MOVE),
+        loadFirstClipFromFBX(fbxLoader, PLAYER_FBX_IN_AIR),
+        loadFirstClipFromFBX(fbxLoader, PLAYER_FBX_JUMP),
+        loadFirstClipFromFBX(fbxLoader, PLAYER_FBX_LEFT_STRAFE),
+        loadFirstClipFromFBX(fbxLoader, PLAYER_FBX_RIGHT_STRAFE)
+      ]);
+
+      if (idleClip)        playerActions.idle         = playerMixer.clipAction(idleClip);
+      if (moveClip)        playerActions.move         = playerMixer.clipAction(moveClip);
+      if (inAirClip)       playerActions.in_air       = playerMixer.clipAction(inAirClip);
+      if (jumpClip)        playerActions.jump         = playerMixer.clipAction(jumpClip);
+      if (leftStrafeClip)  playerActions.left_strafe  = playerMixer.clipAction(leftStrafeClip);
+      if (rightStrafeClip) playerActions.right_strafe = playerMixer.clipAction(rightStrafeClip);
+
+      for (const k of ['idle','move','in_air','left_strafe','right_strafe']) {
+        const a = playerActions[k];
+        if (!a) continue;
+        a.setLoop(THREE.LoopRepeat, Infinity);
+        a.clampWhenFinished = false;
+        a.enabled = true;
+        a.timeScale = 1;
+      }
+
+      if (playerActions.jump) {
+        playerActions.jump.setLoop(THREE.LoopOnce, 1);
+        playerActions.jump.clampWhenFinished = true;
+        playerActions.jump.enabled = true;
+        playerActions.jump.timeScale = 1;
+
+        playerMixer.addEventListener('finished', (event) => {
+          if (event.action === playerActions.jump) {
+            jumpAnimationPlaying = false;
+            playerCurrentState = 'jump_complete';
+          }
+        });
+      }
+
+      moveAnimDir = 1;
+      applyMoveAnimDirection(moveAnimDir, true);
+
+      if (playerActions.idle) playPlayerAction('idle', true);
+      else if (playerActions.move) playPlayerAction('move', true);
+      else if (playerActions.left_strafe) playPlayerAction('left_strafe', true);
+      else if (playerActions.right_strafe) playPlayerAction('right_strafe', true);
+      else if (playerActions.in_air) playPlayerAction('in_air', true);
+    }
+
+    async function loadFirstClipFromFBX(loader, path) {
+      const obj = await new Promise((resolve, reject) => {
+        loader.load(path, resolve, undefined, reject);
+      });
+      if (obj.animations && obj.animations.length > 0) return obj.animations[0];
+      console.warn(`No animations found in: ${path}`);
+      return null;
+    }
+
+    function playPlayerAction(state, immediate = false) {
+      const next = playerActions[state];
+      if (!next) return;
+      if (playerCurrentAction === next) {
+        if (state === 'jump') {
+          next.reset();
+          next.play();
+          playerCurrentState = state;
+        }
+        return;
+      }
+
+      next.reset();
+      next.play();
+
+      if (playerCurrentAction && !immediate) {
+        playerCurrentAction.crossFadeTo(next, FADE_SECONDS, false);
+      } else if (playerCurrentAction && immediate) {
+        playerCurrentAction.stop();
+      }
+
+      playerCurrentAction = next;
+      playerCurrentState = state;
+    }
+
+    function applyMoveAnimDirection(dir, force = false, speedScale = 1) {
+      const action = playerActions.move;
+      if (!action) return;
+
+      const clampedDir = (dir < 0) ? -1 : 1;
+      const desiredTimeScale = clampedDir * speedScale;
+      if (!force && clampedDir === moveAnimDir) {
+        action.timeScale = desiredTimeScale;
+        return;
+      }
+
+      const clip = action.getClip ? action.getClip() : null;
+      const dur = clip ? clip.duration : 0;
+
+      action.timeScale = desiredTimeScale;
+
+      if (dur > 0) {
+        const eps = 1e-4;
+        action.time = (clampedDir < 0) ? Math.max(dur - eps, 0) : eps;
+      }
+
+      moveAnimDir = clampedDir;
+    }
+
+    function updatePlayerAnimationState(dt) {
+      if (!Player || !playerMixer) return;
+
+      // Animation grounding is less sensitive than physics grounding:
+      // We only switch to in_air when there's *no ground within* ANIM_FALL_TRIGGER_DISTANCE below (multi-ray),
+      // and we require a short minimum air time to avoid flicker on tiny ridges/gaps.
+      const groundDist = groundDistanceMultiRay(ANIM_PROBE_LENGTH);
+
+      // Hysteresis + min air-time gate
+      if (groundDist <= ANIM_GROUND_SNAP_DISTANCE) {
+        animInAir = false;
+        animAirTimer = 0;
+      } else {
+        animAirTimer += dt;
+        if (!animInAir && animAirTimer >= ANIM_AIR_MIN_TIME && groundDist > ANIM_FALL_TRIGGER_DISTANCE) {
+          animInAir = true;
+        }
+      }
+
+      if (jumpAnimationPlaying) return;
+
+      let desired = 'idle';
+      if (animInAir) desired = 'in_air';
+      // Use movement intent instead of collision-disturbed velocity. This prevents
+      // rapid idle/move transitions while the player is pressing into a wall.
+      else if (lastSideAxis < 0) desired = 'left_strafe';
+      else if (lastSideAxis > 0) desired = 'right_strafe';
+      else if (lastMoveAxis !== 0) desired = 'move';
+      else desired = 'idle';
+
+      if (desired !== playerCurrentState) playPlayerAction(desired, false);
+
+      if (desired === 'move') {
+        const dir = (lastMoveAxis < 0) ? -1 : 1;
+        const animSpeedScale = playerIsSprinting
+          ? 1 + PLAYER_SPRINT_INCREASE_PERCENT / 100
+          : 1;
+        applyMoveAnimDirection(dir, false, animSpeedScale);
+      } else if (desired === 'left_strafe' || desired === 'right_strafe') {
+        const strafeAction = playerActions[desired];
+        if (strafeAction) {
+          strafeAction.timeScale = playerIsSprinting
+            ? 1 + PLAYER_SPRINT_INCREASE_PERCENT / 100
+            : 1;
+        }
+      } else {
+        if (moveAnimDir !== 1) applyMoveAnimDirection(1, false);
+      }
+    }
+
+    // -------- Input --------
+    function bindKeys() {
+      window.addEventListener('keydown', (e) => {
+        if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+        if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowLeft', 'ArrowDown', 'ArrowRight', 'Space', 'ShiftLeft', 'ShiftRight'].includes(e.code)) {
+          keys[e.code] = true;
+        }
+      });
+      window.addEventListener('keyup', (e) => {
+        if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowLeft', 'ArrowDown', 'ArrowRight', 'Space', 'ShiftLeft', 'ShiftRight'].includes(e.code)) {
+          keys[e.code] = false;
+        }
+      });
+    }
+
+    function getPlayerBasis() {
+      const t = Player.getWorldTransform();
+      const q = t.getRotation();
+      const quat = new THREE.Quaternion(q.x(), q.y(), q.z(), q.w());
+
+      const forward = new THREE.Vector3(0, 0, 1).applyQuaternion(quat).normalize();
+      const right   = new THREE.Vector3(1, 0, 0).applyQuaternion(quat).normalize();
+      return { forward, right };
+    }
+
+
+    function handleInput(dt) {
+      if (!Player) return;
+
+      const forwardKey = keys['ArrowUp']   || keys['KeyW'];
+      const backKey    = keys['ArrowDown'] || keys['KeyS'];
+      const leftKey    = keys['ArrowLeft'] || keys['KeyA'];
+      const rightKey   = keys['ArrowRight'] || keys['KeyD'];
+
+      let moveAxis = 0;
+      if (forwardKey) moveAxis += 1;
+      if (backKey) moveAxis -= 1;
+
+      let sideAxis = 0;
+      if (rightKey) sideAxis -= 1;
+      if (leftKey) sideAxis += 1;
+
+      lastMoveAxis = moveAxis;
+      lastSideAxis = -sideAxis;
+      playerIsSprinting = moveAxis > 0 && !!(keys['ShiftLeft'] || keys['ShiftRight']);
+
+      const grounded = isGrounded();
+
+      applyCharacterMovement(moveAxis, sideAxis, dt, playerIsSprinting);
+
+      const spaceDown = !!keys['Space'];
+      if (spaceDown && !spaceWasDown) {
+        if (grounded) {
+          if (playerActions.jump) {
+            jumpAnimationPlaying = true;
+            playPlayerAction('jump', false);
+          }
+          jump();
+        }
+      }
+      spaceWasDown = spaceDown;
+    }
+
+    function isGrounded() {
+      return playerGrounded || isGroundedRay(2);
+    }
+
+    function isGroundedRay(threshold = 2) {
+      if (!Player) return false;
+      const transform = new Ammo.btTransform();
+      Player.getMotionState().getWorldTransform(transform);
+      const origin = transform.getOrigin();
+
+      const rayStart = new THREE.Vector3(origin.x(), origin.y() - PLAYER_HEIGHT / 2 + PLAYER_RADIUS - 0.1, origin.z());
+      const rayEnd = rayStart.clone().add(new THREE.Vector3(0, -threshold, 0));
+
+      const btStart = new Ammo.btVector3(rayStart.x, rayStart.y, rayStart.z);
+      const btEnd   = new Ammo.btVector3(rayEnd.x,   rayEnd.y,   rayEnd.z);
+      const cb = new Ammo.ClosestRayResultCallback(btStart, btEnd);
+      physicsWorld.rayTest(btStart, btEnd, cb);
+      return cb.hasHit();
+    }
+
+
+    // Returns distance (in world units) to the closest hit below the player using an Ammo ray.
+    // If nothing is hit within probeLen, returns Infinity.
+    function groundDistanceRay(probeLen, offset) {
+      if (!Player) return Infinity;
+      const transform = new Ammo.btTransform();
+      Player.getMotionState().getWorldTransform(transform);
+      const origin = transform.getOrigin();
+
+      const base = new THREE.Vector3(
+        origin.x(),
+        origin.y() - PLAYER_HEIGHT / 2 + PLAYER_RADIUS - 0.1,
+        origin.z()
+      );
+
+      const rayStart = base.clone().add(offset);
+      const rayEnd = rayStart.clone().add(new THREE.Vector3(0, -probeLen, 0));
+
+      const btStart = new Ammo.btVector3(rayStart.x, rayStart.y, rayStart.z);
+      const btEnd   = new Ammo.btVector3(rayEnd.x,   rayEnd.y,   rayEnd.z);
+      const cb = new Ammo.ClosestRayResultCallback(btStart, btEnd);
+      physicsWorld.rayTest(btStart, btEnd, cb);
+
+      if (!cb.hasHit()) return Infinity;
+
+      // m_closestHitFraction is [0,1] along the ray segment
+      const frac = cb.get_m_closestHitFraction();
+      return probeLen * frac;
+    }
+
+    function groundDistanceMultiRay(probeLen) {
+      let minDist = Infinity;
+      for (const off of ANIM_GROUND_PROBE_OFFSETS) {
+        const d = groundDistanceRay(probeLen, off);
+        if (d < minDist) minDist = d;
+      }
+      return minDist;
+    }
+
+    function updatePlayerContacts() {
+      playerGrounded = false;
+      playerOnWall = false;
+      playerOnSlope = false;
+      playerWallNormal.set(0, 0, 0);
+
+      if (!Player || !dispatcher || !playerPtr) return;
+
+      const t = Player.getWorldTransform();
+      const o = t.getOrigin();
+      const centerY = o.y();
+      const bottomY = centerY - (PLAYER_HEIGHT / 2);
+      const groundBandTopY = bottomY + (PLAYER_HEIGHT * GROUND_BAND_FRACTION);
+      const slopeDetectorTopY = bottomY + PLAYER_SLOPE_DETECTOR_HEIGHT;
+
+      const numManifolds = dispatcher.getNumManifolds();
+
+      for (let i = 0; i < numManifolds; i++) {
+        const manifold = dispatcher.getManifoldByIndexInternal(i);
+        const body0 = manifold.getBody0();
+        const body1 = manifold.getBody1();
+
+        const ptr0 = Ammo.getPointer(body0);
+        const ptr1 = Ammo.getPointer(body1);
+
+        const isPlayer0 = (ptr0 === playerPtr);
+        const isPlayer1 = (ptr1 === playerPtr);
+        if (!isPlayer0 && !isPlayer1) continue;
+
+        const numContacts = manifold.getNumContacts();
+        for (let j = 0; j < numContacts; j++) {
+          const pt = manifold.getContactPoint(j);
+          if (pt.getDistance() >= 0) continue;
+
+          const nB = pt.get_m_normalWorldOnB();
+          let nx = nB.x(), ny = nB.y(), nz = nB.z();
+
+          // Orient the contact normal so it always points away from the surface
+          // and toward the player.
+          if (isPlayer1) { nx = -nx; ny = -ny; nz = -nz; }
+
+          const pA = pt.get_m_positionWorldOnA();
+          const pB = pt.get_m_positionWorldOnB();
+          const pPlayer = isPlayer0 ? pA : pB;
+          const py = pPlayer.y();
+
+          if (py <= (groundBandTopY + 0.05) && ny > GROUND_NORMAL_MIN_Y) {
+            playerGrounded = true;
+          }
+
+          const horizontalLengthSq = nx * nx + nz * nz;
+          // A non-flat, upward-facing contact inside the small band at the
+          // capsule's base is treated as a slope that may need climbing help.
+          if (
+            py <= (slopeDetectorTopY + 0.05) &&
+            ny > WALL_NORMAL_MAX_Y &&
+            horizontalLengthSq > 1e-4
+          ) {
+            playerOnSlope = true;
+          }
+
+          if (horizontalLengthSq > 1e-5 && Math.abs(ny) <= WALL_NORMAL_MAX_Y) {
+            const inverseLength = 1 / Math.sqrt(horizontalLengthSq);
+            playerOnWall = true;
+            playerWallNormal.x += nx * inverseLength;
+            playerWallNormal.z += nz * inverseLength;
+          }
+        }
+      }
+
+      if (playerOnWall) {
+        playerWallNormal.y = 0;
+        if (playerWallNormal.lengthSq() > 1e-6) {
+          playerWallNormal.normalize();
+        } else {
+          playerOnWall = false;
+        }
+      }
+    }
+
+    function applyWallCollisionForce() {
+      if (!Player || !playerOnWall) return;
+
+      const force = new Ammo.btVector3(
+        playerWallNormal.x * WALL_PUSH_AWAY_FORCE,
+        -WALL_PUSH_DOWN_FORCE,
+        playerWallNormal.z * WALL_PUSH_AWAY_FORCE
+      );
+      Player.applyCentralForce(force);
+      Player.activate();
+      Ammo.destroy(force);
+    }
+
+    function applySlopeAssistForce() {
+      const hasMovementInput = lastMoveAxis !== 0 || lastSideAxis !== 0;
+      if (!Player || !playerGrounded || !playerOnSlope || !hasMovementInput) return;
+
+      const force = new Ammo.btVector3(0, PLAYER_SLOPE_UP_FORCE, 0);
+      Player.applyCentralForce(force);
+      Player.activate();
+      Ammo.destroy(force);
+    }
+
+    function jump() {
+      const lv = Player.getLinearVelocity();
+      Player.setLinearVelocity(new Ammo.btVector3(lv.x(), PLAYER_JUMP_IMPULSE, lv.z()));
+      Player.activate();
+    }
+
+    function applyCharacterMovement(moveAxis, sideAxis, dt, isSprinting) {
+      if (!Player) return;
+
+      const grounded = isGrounded();
+      if (!PLAYER_MOVE_MIDAIR && !grounded) {
+        moveAxis = 0;
+        sideAxis = 0;
+      }
+
+      const lv = Player.getLinearVelocity();
+      const current = new THREE.Vector3(lv.x(), 0, lv.z());
+
+      const { forward, right } = getPlayerBasis();
+
+      const input = forward.clone().multiplyScalar(moveAxis)
+        .add(right.clone().multiplyScalar(sideAxis));
+      if (input.lengthSq() > 1) input.normalize();
+      const sprintScale = isSprinting ? 1 + PLAYER_SPRINT_INCREASE_PERCENT / 100 : 1;
+      const maxSpeed = PLAYER_MAX_SPEED * sprintScale;
+      const desired = input.multiplyScalar(maxSpeed);
+
+      const accel = grounded ? PLAYER_ACCEL : PLAYER_AIR_ACCEL * PLAYER_MID_AIR_DAMPEN;
+      const brake = grounded ? PLAYER_BRAKE : PLAYER_AIR_BRAKE;
+
+      const isMoving = moveAxis !== 0 || sideAxis !== 0;
+      const target = isMoving ? desired : new THREE.Vector3(0, 0, 0);
+      const rate = isMoving ? accel : brake;
+
+      const maxDelta = rate * dt;
+      const delta = target.clone().sub(current);
+      const deltaLen = delta.length();
+      if (deltaLen > maxDelta && deltaLen > 1e-6) delta.multiplyScalar(maxDelta / deltaLen);
+      const newVel = current.clone().add(delta);
+
+      if (PLAYER_USE_STRAFE_DAMP && sideAxis === 0) {
+        const sideDamp = grounded ? PLAYER_SIDE_DAMP_GROUND : PLAYER_SIDE_DAMP_AIR;
+        const f = forward.clone(); f.y = 0; f.normalize();
+        const r = right.clone();   r.y = 0; r.normalize();
+
+        const fSpd = newVel.dot(f);
+        const rSpd = newVel.dot(r);
+
+        const rKeep = Math.exp(-sideDamp * dt);
+        const rSpdDamped = rSpd * rKeep;
+
+        newVel.copy(f.multiplyScalar(fSpd).add(r.multiplyScalar(rSpdDamped)));
+      }
+
+      const spd = newVel.length();
+      if (spd > maxSpeed) newVel.multiplyScalar(maxSpeed / spd);
+
+      const vy = lv.y();
+
+      Player.setFriction(PLAYER_DEFAULT_FRICTION);
+
+      Player.setLinearVelocity(new Ammo.btVector3(newVel.x, vy, newVel.z));
+      Player.activate();
+    }
+
+    function turn(delta) {
+      const t = Player.getWorldTransform();
+      const rot = t.getRotation();
+      const dq = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), delta);
+      const q = new THREE.Quaternion(rot.x(), rot.y(), rot.z(), rot.w()).multiply(dq);
+      t.setRotation(new Ammo.btQuaternion(q.x, q.y, q.z, q.w));
+      Player.setWorldTransform(t);
+      Player.activate();
+    }
+
+    // -------- Loop --------
+    function update() {
+      const dt = clock.getDelta();
+      requestAnimationFrame(update);
+
+      physicsWorld.stepSimulation(dt, 1);
+      updatePlayerContacts();
+      handleInput(dt);
+      applySlopeAssistForce();
+      applyWallCollisionForce();
+
+      syncVisualsFromPhysics();
+
+      updatePlayerAnimationState(dt);
+      if (playerMixer) playerMixer.update(dt);
+
+      updateCamera();
+      renderer.render(scene, camera);
+    }
+
+    function syncVisualsFromPhysics() {
+      for (const obj of gameObjects) {
+        const { body, mesh, visual, visualOffset, visualRotationOffset } = obj;
+        const ms = body.getMotionState();
+        if (!ms) continue;
+
+        ms.getWorldTransform(tmpTransform);
+        const origin = tmpTransform.getOrigin();
+        const rot = tmpTransform.getRotation();
+
+        if (mesh) {
+          mesh.position.set(origin.x(), origin.y(), origin.z());
+          mesh.quaternion.set(rot.x(), rot.y(), rot.z(), rot.w());
+        }
+
+        if (obj.axes) {
+          obj.axes.position.set(origin.x(), origin.y(), origin.z());
+          obj.axes.quaternion.set(rot.x(), rot.y(), rot.z(), rot.w());
+        }
+
+        if (visual) {
+          const meshQuat = new THREE.Quaternion(rot.x(), rot.y(), rot.z(), rot.w());
+          const offsetRotated = visualOffset ? visualOffset.clone().applyQuaternion(meshQuat) : new THREE.Vector3(0, 0, 0);
+          visual.position.set(origin.x(), origin.y(), origin.z());
+          visual.position.add(offsetRotated);
+          if (visualRotationOffset) {
+            const finalQuat = meshQuat.clone().multiply(visualRotationOffset);
+            visual.quaternion.copy(finalQuat);
+          } else {
+            visual.quaternion.copy(meshQuat);
+          }
+        }
+      }
+
+      if (Player) {
+        Player.getMotionState().getWorldTransform(tmpTransform);
+        const o = tmpTransform.getOrigin();
+        const r = tmpTransform.getRotation();
+
+        const bodyPos = new THREE.Vector3(o.x(), o.y(), o.z());
+        const bodyQuat = new THREE.Quaternion(r.x(), r.y(), r.z(), r.w());
+
+        if (playerDebugMesh) {
+          playerDebugMesh.position.copy(bodyPos);
+          playerDebugMesh.quaternion.copy(bodyQuat);
+        }
+        if (Player.__axes) {
+          Player.__axes.position.copy(bodyPos);
+          Player.__axes.quaternion.copy(bodyQuat);
+        }
+
+        if (playerVisual) {
+          playerVisual.position.copy(bodyPos).add(PLAYER_MODEL_OFFSET.clone().applyQuaternion(bodyQuat));
+          playerVisual.quaternion.copy(bodyQuat).multiply(new THREE.Quaternion().setFromEuler(PLAYER_MODEL_ROTATION));
+        }
+      }
+    }
+
+    function updateCamera() {
+      if (!Player) return;
+      const ms = Player.getMotionState();
+      if (!ms) return;
+
+      ms.getWorldTransform(tmpTransform);
+      const o = tmpTransform.getOrigin();
+      const r = tmpTransform.getRotation();
+      const playerPosition = new THREE.Vector3(o.x(), o.y(), o.z());
+      const playerRotation = new THREE.Quaternion(r.x(), r.y(), r.z(), r.w());
+
+      // Orbit behind the player. Pitch is applied in player-local space before yaw.
+      const cameraOffset = new THREE.Vector3(0, 0, -CAMERA_DISTANCE)
+        .applyAxisAngle(new THREE.Vector3(1, 0, 0), cameraPitch)
+        .applyQuaternion(playerRotation);
+      const lookTarget = playerPosition.clone().add(new THREE.Vector3(0, CAMERA_LOOK_HEIGHT, 0));
+
+      camera.position.copy(playerPosition).add(cameraOffset);
+      camera.lookAt(lookTarget);
+    }
+
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    // Start!
+    init();
+  </script>
+</body>
+</html>
